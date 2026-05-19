@@ -6,10 +6,11 @@ const {
   AudioPlayerStatus,
   VoiceConnectionStatus,
   getVoiceConnection,
+  StreamType,
 } = require('@discordjs/voice');
-const gtts = require('gtts');
-const fs   = require('fs');
-const path = require('path');
+const gtts  = require('gtts');
+const fs    = require('fs');
+const path  = require('path');
 const { v4: uuidv4 } = require('uuid');
 
 require('dotenv').config();
@@ -42,8 +43,16 @@ function getState(guildId) {
       textChannelId: null,
       processing:    false,
     };
-    player.on(AudioPlayerStatus.Idle,  () => processQueue(guildId));
-    player.on('error', (err) => { console.error('[Player]', err.message); processQueue(guildId); });
+    player.on(AudioPlayerStatus.Idle, () => {
+      console.log('[Player] Idle → next');
+      processQueue(guildId);
+    });
+    player.on(AudioPlayerStatus.Playing,   () => console.log('[Player] ▶ Playing'));
+    player.on(AudioPlayerStatus.Buffering, () => console.log('[Player] ⏳ Buffering'));
+    player.on('error', (err) => {
+      console.error('[Player ERROR]', err.message, err.resource?.metadata);
+      processQueue(guildId);
+    });
     guildState.set(guildId, state);
   }
   return guildState.get(guildId);
@@ -53,39 +62,84 @@ function getState(guildId) {
 
 function processQueue(guildId) {
   const s = getState(guildId);
-  if (!s.connection || s.queue.length === 0) { s.processing = false; return; }
+  console.log(`[Queue] len=${s.queue.length} processing=${s.processing} conn=${!!s.connection}`);
+  if (!s.connection || s.queue.length === 0) {
+    s.processing = false;
+    return;
+  }
   s.processing = true;
-  const { resource, file } = s.queue.shift();
+  const { file } = s.queue.shift();
+
   try {
+    // Create a fresh readable stream from the saved mp3 file
+    const stream   = fs.createReadStream(file);
+    const resource = createAudioResource(stream, {
+      inputType: StreamType.Arbitrary,
+      inlineVolume: false,
+    });
+
+    resource.playStream.on('error', (err) => {
+      console.error('[Stream ERROR]', err.message);
+    });
+
     s.connection.subscribe(s.player);
     s.player.play(resource);
-    setTimeout(() => fs.unlink(file, () => {}), 15000);
+    console.log(`[Queue] Playing: ${file}`);
+
+    // Clean up after playback
+    setTimeout(() => fs.unlink(file, () => {}), 30000);
   } catch (err) {
-    console.error('[Queue]', err.message);
+    console.error('[Queue PLAY]', err.message);
     s.processing = false;
+    fs.unlink(file, () => {});
     processQueue(guildId);
   }
 }
 
+// ─── TTS → save mp3 → enqueue ─────────────────────────────────────────────────
+
 function enqueueTTS(text, guildId) {
-  console.log(`[TTS] "${text}"`);
+  console.log(`[TTS] Generating: "${text}"`);
   const tmpFile = path.join('/tmp', `tts_${uuidv4()}.mp3`);
+
   new gtts(text, 'en').save(tmpFile, (err) => {
-    if (err) { console.error('[gTTS]', err.message); return; }
-    const s = getState(guildId);
-    if (!s.connection) { fs.unlink(tmpFile, () => {}); return; }
-    s.queue.push({ resource: createAudioResource(tmpFile), file: tmpFile });
-    if (!s.processing) processQueue(guildId);
+    if (err) {
+      console.error('[gTTS ERROR]', err.message);
+      return;
+    }
+
+    // Verify file exists and has content
+    fs.stat(tmpFile, (statErr, stats) => {
+      if (statErr || stats.size === 0) {
+        console.error('[gTTS] File missing or empty:', statErr?.message);
+        return;
+      }
+      console.log(`[TTS] Saved ${stats.size} bytes → ${tmpFile}`);
+
+      const s = getState(guildId);
+      if (!s.connection) {
+        console.log('[TTS] No connection, discarding');
+        fs.unlink(tmpFile, () => {});
+        return;
+      }
+
+      s.queue.push({ file: tmpFile });
+      console.log(`[TTS] Queued. Queue size: ${s.queue.length}`);
+      if (!s.processing) processQueue(guildId);
+    });
   });
 }
 
-// ─── Voice join — NO entersState, no timeout, just join and set immediately ───
+// ─── Voice join ───────────────────────────────────────────────────────────────
 
 function joinVC(voiceChannel, guildId, textChannelId) {
-  console.log(`[Voice] Joining "${voiceChannel.name}"`);
+  console.log(`[Voice] Joining "${voiceChannel.name}" (${voiceChannel.id})`);
 
   const existing = getVoiceConnection(guildId);
-  if (existing) existing.destroy();
+  if (existing) {
+    console.log('[Voice] Destroying old connection');
+    existing.destroy();
+  }
 
   const conn = joinVoiceChannel({
     channelId:      voiceChannel.id,
@@ -94,23 +148,21 @@ function joinVC(voiceChannel, guildId, textChannelId) {
     selfDeaf:       false,
   });
 
-  // Set state immediately — don't wait for Ready
   const s = getState(guildId);
   s.connection    = conn;
   s.textChannelId = textChannelId;
+  console.log(`[Voice] Connection set. textChannelId=${textChannelId}`);
 
-  conn.on(VoiceConnectionStatus.Ready, () => {
-    console.log(`[Voice] Ready in "${voiceChannel.name}"`);
-  });
-
+  conn.on(VoiceConnectionStatus.Ready,       () => console.log('[Voice] ✅ Ready'));
+  conn.on(VoiceConnectionStatus.Connecting,  () => console.log('[Voice] Connecting...'));
+  conn.on(VoiceConnectionStatus.Signalling,  () => console.log('[Voice] Signalling...'));
   conn.on(VoiceConnectionStatus.Disconnected, () => {
-    console.log('[Voice] Disconnected');
+    console.log('[Voice] Disconnected — destroying');
     conn.destroy();
     const st = getState(guildId);
     st.connection = null; st.queue = []; st.processing = false;
   });
-
-  conn.on('error', (e) => console.error('[Voice err]', e.message));
+  conn.on('error', (e) => console.error('[Voice ERROR]', e.message));
 
   return conn;
 }
@@ -152,16 +204,10 @@ client.on('interactionCreate', async (interaction) => {
     if (!vc) {
       return interaction.reply({ content: '❌ Join a voice channel first!', flags: 64 });
     }
-
-    // Reply to Discord INSTANTLY — synchronous, no await before this
     interaction.reply({ content: `✅ Joining **${vc.name}**...`, flags: 64 }).catch(() => {});
-
-    // Join voice — synchronous function, no await needed
     joinVC(vc, guildId, interaction.channelId);
-
-    // Confirm in channel
     interaction.channel.send(
-      `✅ **TTS active!** I'm in **${vc.name}** — type anything here and I'll speak it.`
+      `✅ **TTS active in <#${interaction.channelId}>!** Type anything and I'll speak it.`
     ).catch(() => {});
   }
 
@@ -202,8 +248,14 @@ client.on('messageCreate', async (message) => {
     if (vc) joinVC(vc, guildId, message.channelId);
   }
 
-  if (!state.connection) return;
-  if (state.textChannelId && message.channelId !== state.textChannelId) return;
+  if (!state.connection) {
+    console.log('[Msg] No connection — skip');
+    return;
+  }
+  if (state.textChannelId && message.channelId !== state.textChannelId) {
+    console.log(`[Msg] Wrong channel — skip`);
+    return;
+  }
 
   const content = message.content.trim();
   if (!content || content.startsWith('/') || content.startsWith('!')) return;
